@@ -5,10 +5,21 @@ import { useForm, zodForm$ } from '@modular-forms/qwik';
 import { useSpeakLocale } from 'qwik-speak';
 import { z } from 'zod';
 import type { DocumentHead } from '@builder.io/qwik-city';
+import {
+  applyCloseChannel,
+  applyLeaveListen,
+  applyRequestListen,
+  applyReopenChannel,
+  applySetRoomCapacity,
+  byRequestedAt,
+  isLanguageOpen,
+  restoreSuspended
+} from '~/lib/listen-capacity';
+import type { ListenRequest } from '~/lib/listen-capacity';
 
 type SpeechStatus = 'queued' | 'speaking' | 'done' | 'skipped';
-type InterpreterStatus = 'active' | 'handoff' | 'standby';
-type Room = { id: string; name: string; topic: string; simultaneousChannels: number };
+type InterpreterStatus = 'active' | 'handoff' | 'standby' | 'closed';
+type Room = { id: string; name: string; topic: string; simultaneousChannels: number; listenCapacity: number; capacityVersion: number };
 type Speech = { id: string; roomId: string; speaker: string; delegation: string; language: string; topic: string; plannedSeconds: number; remainingSeconds: number; status: SpeechStatus; updatedAt: string };
 type Channel = { id: string; roomId: string; language: string; interpreter: string; status: InterpreterStatus; health: number };
 type Term = { id: string; phrase: string; translation: string; language: string; approved: boolean };
@@ -23,14 +34,15 @@ interface ConferenceState {
   terms: Term[];
   captions: Caption[];
   audits: Audit[];
+  listenRequests: ListenRequest[];
   lowLatency: boolean;
 }
 
 const now = new Date().toISOString();
 const seed: ConferenceState = {
   rooms: [
-    { id: 'hall-a', name: 'A厅 · 全体会议', topic: '全球气候融资', simultaneousChannels: 6 },
-    { id: 'hall-b', name: 'B厅 · 技术分会', topic: '人工智能基础设施', simultaneousChannels: 4 }
+    { id: 'hall-a', name: 'A厅 · 全体会议', topic: '全球气候融资', simultaneousChannels: 6, listenCapacity: 3, capacityVersion: 1 },
+    { id: 'hall-b', name: 'B厅 · 技术分会', topic: '人工智能基础设施', simultaneousChannels: 4, listenCapacity: 2, capacityVersion: 1 }
   ],
   activeRoomId: 'hall-a',
   speechQueue: [
@@ -56,6 +68,13 @@ const seed: ConferenceState = {
     { id: 'audit-1', at: now, roomId: 'hall-a', message: 'Amina Diallo 开始发言，中文频道由周雨接续' },
     { id: 'audit-2', at: new Date(Date.now() - 90000).toISOString(), roomId: 'hall-a', message: '临时插话申请已插入队列第2位' }
   ],
+  listenRequests: [
+    { id: 'listen-1', roomId: 'hall-a', delegate: '陈晨', language: '中文', status: 'listening', requestedAt: new Date(Date.now() - 300000).toISOString(), updatedAt: now },
+    { id: 'listen-2', roomId: 'hall-a', delegate: 'Fatima Noor', language: '西班牙语', status: 'listening', requestedAt: new Date(Date.now() - 240000).toISOString(), updatedAt: now },
+    { id: 'listen-3', roomId: 'hall-a', delegate: 'Jon Weber', language: '中文', status: 'listening', requestedAt: new Date(Date.now() - 180000).toISOString(), updatedAt: now },
+    { id: 'listen-4', roomId: 'hall-a', delegate: 'Sofia Rossi', language: '法语', status: 'waiting', requestedAt: new Date(Date.now() - 60000).toISOString(), updatedAt: now },
+    { id: 'listen-5', roomId: 'hall-b', delegate: '金敏俊', language: '中文', status: 'listening', requestedAt: new Date(Date.now() - 120000).toISOString(), updatedAt: now }
+  ],
   lowLatency: false
 };
 
@@ -71,7 +90,14 @@ type QueueForm = z.infer<typeof queueSchema>;
 
 function readState(): ConferenceState {
   if (typeof localStorage === 'undefined') return seed;
-  try { return JSON.parse(localStorage.getItem('conference-interpretation-v1') ?? 'null') as ConferenceState ?? seed; } catch { return seed; }
+  try {
+    const parsed = JSON.parse(localStorage.getItem('conference-interpretation-v1') ?? 'null') as ConferenceState | null;
+    if (!parsed) return seed;
+    // 旧数据迁移：补齐厅级容量与收听请求
+    parsed.rooms = (parsed.rooms ?? []).map((room) => ({ ...room, listenCapacity: room.listenCapacity ?? 4, capacityVersion: room.capacityVersion ?? 1 }));
+    parsed.listenRequests = parsed.listenRequests ?? [];
+    return parsed;
+  } catch { return seed; }
 }
 
 const advanceSpeech$ = $((state: ConferenceState, id: string, status: SpeechStatus) => {
@@ -79,7 +105,59 @@ const advanceSpeech$ = $((state: ConferenceState, id: string, status: SpeechStat
   if (status === 'speaking') {
     state.speechQueue = state.speechQueue.map((item) => item.id !== id && item.roomId === state.activeRoomId && item.status === 'speaking' ? { ...item, status: 'done' } : item);
   }
+  // 发言段落结束（含被下一位顶替）：挂起的收听放回，占用与候补重算
+  const speech = state.speechQueue.find((item) => item.id === id);
+  if (speech && status !== 'queued') restoreSuspended(state, speech.roomId);
   state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: state.activeRoomId, message: `发言 ${id} 状态更新为 ${status}` });
+});
+
+const requestListen$ = $((state: ConferenceState, delegate: string, language: string) => {
+  const roomId = state.activeRoomId;
+  const result = applyRequestListen(state, roomId, delegate, language);
+  if (!result) return;
+  const name = delegate.trim();
+  const message = result.changedLanguage
+    ? `${name} 将收听语种切换为 ${language}`
+    : `${name} 申请收听 ${language}${result.switchedFrom.length ? '（已从其他厅切走）' : ''}：${result.status === 'listening' ? '已接通' : '容量已满，进入候补'}`;
+  state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId, message });
+});
+
+const leaveListen$ = $((state: ConferenceState, requestId: string) => {
+  const req = applyLeaveListen(state, requestId);
+  if (!req) return;
+  state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: req.roomId, message: `${req.delegate} 停止收听，候补按先后补位` });
+});
+
+// 容量修改带版本号：两位主持人同时改同一厅时，后提交的一方收到冲突而不是互相覆盖
+const setRoomCapacity$ = $((state: ConferenceState, roomId: string, capacity: number, expectedVersion: number) => {
+  const room = state.rooms.find((item) => item.id === roomId);
+  if (!room) return false;
+  const result = applySetRoomCapacity(state, roomId, capacity, expectedVersion);
+  if (result === 'conflict') {
+    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId, message: `容量修改冲突：${room.name} 已被另一位主持人更新为 ${room.listenCapacity}（v${room.capacityVersion}），本次提交被拒绝` });
+    return false;
+  }
+  if (result === 'ok') {
+    state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId, message: `${room.name} 收听容量调整为 ${room.listenCapacity}（v${room.capacityVersion}），占用与候补已重算` });
+  }
+  return result === 'ok';
+});
+
+const closeChannel$ = $((state: ConferenceState, channelId: string) => {
+  const channel = state.channels.find((item) => item.id === channelId);
+  if (!channel || channel.status === 'closed') return;
+  channel.status = 'closed';
+  // 挂上的收听请求转进候补；已播出字幕仍挂在原发言人名下，不动
+  const moved = applyCloseChannel(state, channel.roomId, channel.language);
+  state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: channel.roomId, message: `${channel.language} 频道关闭，${moved} 个收听请求转入候补；已播出字幕保留在原发言人名下` });
+});
+
+const reopenChannel$ = $((state: ConferenceState, channelId: string) => {
+  const channel = state.channels.find((item) => item.id === channelId);
+  if (!channel || channel.status !== 'closed') return;
+  channel.status = 'active';
+  applyReopenChannel(state, channel.roomId);
+  state.audits.unshift({ id: crypto.randomUUID(), at: new Date().toISOString(), roomId: channel.roomId, message: `${channel.language} 频道恢复，候补按先后补位` });
 });
 
 const addCaption$ = $((state: ConferenceState, speechId: string, text: string) => {
@@ -117,6 +195,51 @@ export default component$(() => {
   const roomQueue = () => state.speechQueue.filter((item) => item.roomId === state.activeRoomId);
   const roomChannels = () => state.channels.filter((item) => item.roomId === state.activeRoomId);
   const currentSpeech = () => roomQueue().find((item) => item.status === 'speaking');
+  const openLanguages = () => roomChannels().filter((channel) => channel.status !== 'closed').map((channel) => channel.language);
+  const roomListenRequests = () => state.listenRequests.filter((item) => item.roomId === state.activeRoomId);
+  const attachedList = () => roomListenRequests().filter((item) => item.status !== 'waiting').sort(byRequestedAt);
+  const waitingList = () => roomListenRequests().filter((item) => item.status === 'waiting').sort(byRequestedAt);
+  const listeningCount = () => roomListenRequests().filter((item) => item.status === 'listening').length;
+
+  const capacityValue = useSignal(0);
+  const capacityBaseVersion = useSignal(0);
+  const capacityConflict = useSignal('');
+  const listenName = useSignal('');
+  const listenLang = useSignal('');
+
+  // 切厅时重新快照容量草稿（带版本号），语种默认选第一个开放频道
+  useVisibleTask$(({ track }) => {
+    const roomId = track(() => state.activeRoomId);
+    const room = state.rooms.find((item) => item.id === roomId);
+    if (!room) return;
+    capacityValue.value = room.listenCapacity;
+    capacityBaseVersion.value = room.capacityVersion;
+    capacityConflict.value = '';
+    listenName.value = '';
+    listenLang.value = state.channels.find((channel) => channel.roomId === roomId && channel.status !== 'closed')?.language ?? '';
+  });
+
+  const applyCapacity$ = $(async () => {
+    const room = activeRoom();
+    const ok = await setRoomCapacity$(state, room.id, capacityValue.value, capacityBaseVersion.value);
+    if (ok) {
+      capacityConflict.value = '';
+    } else {
+      capacityConflict.value = `冲突：容量已被另一位主持人改为 ${room.listenCapacity}（v${room.capacityVersion}），已为你同步最新版本，确认后请重新提交`;
+    }
+    capacityBaseVersion.value = room.capacityVersion;
+  });
+
+  // 模拟另一位主持人/大屏带宽调度直接压低容量（总是成功，用于触发草稿冲突）
+  const squeezeCapacity$ = $(async () => {
+    const room = activeRoom();
+    await setRoomCapacity$(state, room.id, Math.max(0, room.listenCapacity - 1), room.capacityVersion);
+  });
+
+  const submitListen$ = $(async () => {
+    await requestListen$(state, listenName.value, listenLang.value);
+    listenName.value = '';
+  });
 
   const selectRoom$ = $((roomId: string) => {
     state.activeRoomId = roomId;
@@ -197,12 +320,76 @@ export default component$(() => {
             <div style="padding:12px 0;border-bottom:1px solid #e6efee" key={channel.id}>
               <div style="display:flex;justify-content:space-between"><b>{channel.language} · {channel.interpreter}</b><span class="pill">{channel.status}</span></div>
               <div class="decorative" style="margin:8px 0"><Progress.Root value={channel.health} max={100} /></div>
-              <div style="display:flex;gap:8px"><button class="secondary" onClick$={() => handoff$(channel.id)}>开始交接</button>{channel.status === 'handoff' && <button onClick$={() => completeHandoff$(channel.id, `替补译员-${channel.language}`)}>完成交接</button>}</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                {channel.status !== 'closed' && <button class="secondary" onClick$={() => handoff$(channel.id)}>开始交接</button>}
+                {channel.status === 'handoff' && <button onClick$={() => completeHandoff$(channel.id, `替补译员-${channel.language}`)}>完成交接</button>}
+                {channel.status !== 'closed'
+                  ? <button class="danger" onClick$={() => closeChannel$(state, channel.id)}>关闭频道</button>
+                  : <button onClick$={() => reopenChannel$(state, channel.id)}>恢复频道</button>}
+              </div>
             </div>
           ))}
           <h3>实时字幕修正</h3>
           {currentSpeech() ? <CaptionForm onSubmit$={publishCaption$}><CaptionField name="text">{(field, props) => <textarea {...props} rows={3} value={field.value} onInput$={(event) => field.value = (event.target as HTMLTextAreaElement).value} placeholder="输入或修正当前字幕" />}</CaptionField><button type="submit">提交新版字幕</button></CaptionForm> : <p>当前没有发言中的代表。</p>}
           {state.captions.filter((caption) => caption.roomId === state.activeRoomId).map((caption) => <div style="margin-top:10px;padding:10px;background:#f1f8f7;border-radius:10px" key={caption.id}><b>{caption.interpreter} · v{caption.revision}</b><p>{caption.text}</p></div>)}
+        </aside>
+      </section>
+
+      <section class="grid" style="margin-top:18px">
+        <article class="panel">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <h2>厅级收听容量</h2>
+            <span class="pill">占用 {listeningCount()} / {activeRoom().listenCapacity} · 挂起 {attachedList().filter((item) => item.status === 'suspended').length} · 候补 {waitingList().length}</span>
+          </div>
+          <div class="decorative" style="margin:10px 0"><Progress.Root value={listeningCount()} max={Math.max(1, activeRoom().listenCapacity)} /></div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="number" min={0} max={99} style="max-width:110px" value={capacityValue.value} onInput$={(event) => capacityValue.value = Number((event.target as HTMLInputElement).value)} />
+            <button onClick$={applyCapacity$}>应用容量</button>
+            <button class="secondary" onClick$={squeezeCapacity$}>大屏腾带宽：容量-1</button>
+            <small style="color:#638087">版本 v{activeRoom().capacityVersion}</small>
+          </div>
+          {capacityConflict.value && <p style="color:#c2413b;margin:8px 0 0">{capacityConflict.value}</p>}
+          <p style="color:#638087;font-size:13px">压低容量不会掐断正在听的代表：超出的先挂起并保留所选语种，本段发言结束后放回；每次修改后占用与候补一起重算。</p>
+
+          <h3>正在听 / 挂起</h3>
+          {attachedList().length === 0 && <p>当前没有代表收听本厅。</p>}
+          {attachedList().map((req) => (
+            <div class="queue-row" key={req.id}>
+              <strong>{req.status === 'suspended' ? '挂起' : '收听'}</strong>
+              <div><b>{req.delegate}</b><div style="color:#638087;font-size:13px">{req.language}{req.status === 'suspended' ? ' · 保留语种，本段发言结束后放回' : ''}</div></div>
+              <span class="pill">{req.status}</span>
+              <div><button class="danger" onClick$={() => leaveListen$(state, req.id)}>离开</button></div>
+            </div>
+          ))}
+
+          <h3>候补队列（按申请先后补位）</h3>
+          {waitingList().length === 0 && <p>候补为空。</p>}
+          {waitingList().map((req, index) => (
+            <div class="queue-row" key={req.id}>
+              <strong>#{index + 1}</strong>
+              <div><b>{req.delegate}</b><div style="color:#638087;font-size:13px">{req.language}{isLanguageOpen(state, req.roomId, req.language) ? '' : ' · 语种频道已关闭，等待恢复'}</div></div>
+              <span class="pill">waiting</span>
+              <div><button class="secondary" onClick$={() => leaveListen$(state, req.id)}>取消</button></div>
+            </div>
+          ))}
+        </article>
+
+        <aside class="panel">
+          <h2>代表收听申请</h2>
+          <p style="color:#638087;font-size:13px">一位代表同一时间只挂一个厅；已在其他厅收听的代表申请本厅视为切走，旧厅空出的位置按候补先后补上。</p>
+          <div style="display:grid;gap:10px">
+            <input value={listenName.value} onInput$={(event) => listenName.value = (event.target as HTMLInputElement).value} placeholder="代表姓名" />
+            <select value={listenLang.value} onChange$={(event) => listenLang.value = (event.target as HTMLSelectElement).value}>
+              {openLanguages().length === 0 && <option value="">本厅暂无开放语种</option>}
+              {openLanguages().map((language) => <option value={language} key={language}>{language}</option>)}
+            </select>
+            <button disabled={!listenName.value.trim() || !listenLang.value} onClick$={submitListen$}>申请收听 / 切换语种</button>
+          </div>
+          <h3>本厅开放语种</h3>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            {openLanguages().map((language) => <span class="pill" key={language}>{language}</span>)}
+            {openLanguages().length === 0 && <span>全部频道已关闭</span>}
+          </div>
         </aside>
       </section>
 

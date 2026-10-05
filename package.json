@@ -10,6 +10,7 @@
     "build.client": "vite build",
     "build.preview": "vite build --ssr src/entry.preview.tsx",
     "build.types": "tsc --incremental --noEmit",
+    "test": "tsc src/lib/listen-capacity.ts --outDir tmp/listen-test --module es2022 --target es2022 --moduleResolution bundler --skipLibCheck && cp src/lib/listen-capacity.test.mjs tmp/listen-test/run.mjs && node tmp/listen-test/run.mjs",
     "preview": "qwik build preview && vite preview --host 0.0.0.0 --port 62029",
     "start": "vite --mode ssr --host 0.0.0.0 --port 62029"
   },
